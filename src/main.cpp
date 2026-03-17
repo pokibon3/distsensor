@@ -1,6 +1,7 @@
 #include "Arduino.h"
 #include "Wire.h"
 #include "st7735.h"
+#include <cstring>
 #include <new>
 
 #if defined(SENSOR_VL53L1X)
@@ -25,26 +26,46 @@ VL53L1X g_sensor;
 #endif
 
 #if defined(HEATMAP_GRID_16)
-constexpr uint8_t kGrid = 16;
+constexpr uint8_t kDefaultRoiIndex = 0;
 #else
-constexpr uint8_t kGrid = 8;
+constexpr uint8_t kDefaultRoiIndex = 1;
 #endif
-constexpr uint8_t kRoiSize = 4;
-// Even-sized ROI needs a stricter center margin to avoid USERROICLIP at edges.
-constexpr uint8_t kRoiMargin = (kRoiSize / 2);
+constexpr uint8_t kRoiModes[4] = {16, 8, 4, 1};
+uint8_t g_roi_mode_index = kDefaultRoiIndex;
+constexpr uint8_t kSw1Pin = PA1;
+bool g_sw1_prev_level = true;
+uint32_t g_sw1_last_change_ms = 0;
 
 constexpr uint8_t kHeatmapPixels = 64;
-constexpr uint8_t kCell = kHeatmapPixels / kGrid;
 constexpr uint8_t kGridX = 2;
 constexpr uint8_t kGridY = 8;
-constexpr uint16_t kPoints = (uint16_t)kGrid * (uint16_t)kGrid;
 uint8_t g_heat[16 * 16] = {};
 uint16_t g_scan_index = 0;
-uint32_t g_scan_count = 0;
-uint32_t g_last_stats_ms = 0;
-uint16_t g_scan_rate = 0;
 uint16_t g_last_mm = 0;
 bool g_has_last_mm = false;
+uint16_t g_cycle_min_mm = 0;
+bool g_cycle_has_min = false;
+uint16_t g_current_mm = 0;
+bool g_current_has_mm = false;
+int16_t g_prev_hx = -1;
+int16_t g_prev_hy = -1;
+
+uint8_t currentRoiSize() {
+  return kRoiModes[g_roi_mode_index];
+}
+
+uint8_t currentGrid() {
+  return currentRoiSize();
+}
+
+uint8_t currentCell() {
+  return (uint8_t)(kHeatmapPixels / currentGrid());
+}
+
+uint16_t currentPoints() {
+  const uint8_t g = currentGrid();
+  return (uint16_t)g * (uint16_t)g;
+}
 
 uint8_t spadForXY16(uint8_t x16, uint8_t y16) {
   if (y16 < 8) {
@@ -54,10 +75,13 @@ uint8_t spadForXY16(uint8_t x16, uint8_t y16) {
 }
 
 uint8_t roiCoordForGrid(uint8_t i) {
-  const uint8_t minc = kRoiMargin;
-  const uint8_t maxc = (uint8_t)(15 - kRoiMargin);
-  if (kGrid <= 1) return 7;
-  return (uint8_t)(minc + ((uint16_t)i * (maxc - minc) + (kGrid - 1) / 2) / (kGrid - 1));
+  const uint8_t grid = currentGrid();
+  const uint8_t roi_margin = currentRoiSize() / 2;
+  const uint8_t minc = roi_margin;
+  const uint8_t maxc = (uint8_t)(15 - roi_margin);
+  if (maxc < minc) return 7;
+  if (grid <= 1) return 7;
+  return (uint8_t)(minc + ((uint16_t)i * (maxc - minc) + (grid - 1) / 2) / (grid - 1));
 }
 
 uint8_t spadForXY(uint8_t x, uint8_t y) {
@@ -88,28 +112,26 @@ uint8_t intensityFromDistance(uint16_t mm, bool measurable, bool valid) {
 }
 
 void drawStaticUi() {
+  const uint8_t grid = currentGrid();
+  const uint8_t cell = currentCell();
   st7735_fill_rect(0, 0, ST7735_WIDTH, ST7735_HEIGHT, BLACK);
 
-  for (uint8_t y = 0; y < kGrid; ++y) {
-    for (uint8_t x = 0; x < kGrid; ++x) {
-      st7735_fill_rect((uint16_t)(kGridX + x * kCell), (uint16_t)(kGridY + y * kCell), kCell - 1, kCell - 1, RGB(6, 8, 12));
+  for (uint8_t y = 0; y < grid; ++y) {
+    for (uint8_t x = 0; x < grid; ++x) {
+      st7735_fill_rect((uint16_t)(kGridX + x * cell), (uint16_t)(kGridY + y * cell), cell - 1, cell - 1, RGB(6, 8, 12));
     }
   }
-  st7735_draw_rect(kGridX - 1, kGridY - 1, kGrid * kCell + 2, kGrid * kCell + 2, SKYBLUE);
+  st7735_draw_rect(kGridX - 1, kGridY - 1, grid * cell + 2, grid * cell + 2, SKYBLUE);
 
   st7735_set_background_color(BLACK);
   st7735_set_color(WHITE);
   st7735_set_cursor(72, 8);
-  st7735_print("VL53L1X V2", FONT_SCALE_8X8);
+  st7735_print("VL53L1X", FONT_SCALE_8X8);
   st7735_set_cursor(72, 18);
-#if defined(HEATMAP_GRID_16)
-  st7735_print("ROI 16x16", FONT_SCALE_8X8);
-#else
-  st7735_print("ROI 8x8", FONT_SCALE_8X8);
-#endif
-
-  st7735_set_cursor(72, 54);
-  st7735_print("scan/s:", FONT_SCALE_8X8);
+  if (currentRoiSize() == 16) st7735_print("ROI 16x16", FONT_SCALE_8X8);
+  else if (currentRoiSize() == 8) st7735_print("ROI 8x8 ", FONT_SCALE_8X8);
+  else if (currentRoiSize() == 4) st7735_print("ROI 4x4 ", FONT_SCALE_8X8);
+  else st7735_print("ROI 1x1 ", FONT_SCALE_8X8);
 }
 
 void printMmLarge(uint16_t mm) {
@@ -125,15 +147,28 @@ void printMmLarge(uint16_t mm) {
   st7735_print(out, FONT_SCALE_16X16);
 }
 
-void drawStats(uint16_t mm, bool timeout, bool valid, bool measurable) {
+void drawHeatCell(uint8_t x, uint8_t y, bool highlight) {
+  const uint8_t grid = currentGrid();
+  const uint8_t cell = currentCell();
+  const uint16_t idx = (uint16_t)y * grid + x;
+  const uint16_t color = heatColor(g_heat[idx]);
+  const uint16_t px = (uint16_t)(kGridX + x * cell);
+  const uint16_t py = (uint16_t)(kGridY + y * cell);
+  st7735_fill_rect(px, py, cell - 1, cell - 1, color);
+  if (highlight && cell >= 2) {
+    st7735_draw_rect(px, py, cell - 1, cell - 1, WHITE);
+  }
+}
+
+void drawStats(bool timeout, bool measurable) {
   char buf[16];
   st7735_fill_rect(72, 30, 84, 18, BLACK);
-  st7735_fill_rect(112, 54, 40, 8, BLACK);
+  st7735_fill_rect(72, 50, 84, 10, BLACK);
 
   st7735_set_background_color(BLACK);
 
-  if (valid || g_has_last_mm) {
-    const uint16_t shown_mm = valid ? mm : g_last_mm;
+  if (g_cycle_has_min || g_has_last_mm) {
+    const uint16_t shown_mm = g_cycle_has_min ? g_cycle_min_mm : g_last_mm;
     st7735_set_color(WHITE);
     st7735_set_cursor(72, 30);
     printMmLarge(shown_mm);
@@ -143,9 +178,14 @@ void drawStats(uint16_t mm, bool timeout, bool valid, bool measurable) {
     st7735_print("----MM", FONT_SCALE_16X16);
   }
 
-  mini_snprintf(buf, sizeof(buf), "%3d", (int)g_scan_rate);
-  st7735_set_color(GREENYELLOW);
-  st7735_set_cursor(112, 54);
+  st7735_set_cursor(72, 50);
+  if (g_current_has_mm) {
+    mini_snprintf(buf, sizeof(buf), "CUR:%4d", (int)g_current_mm);
+    st7735_set_color(CYAN);
+  } else {
+    mini_snprintf(buf, sizeof(buf), "CUR:----");
+    st7735_set_color(DARKGREY);
+  }
   st7735_print(buf, FONT_SCALE_8X8);
 
   st7735_fill_rect(72, 66, 84, 10, BLACK);
@@ -153,25 +193,12 @@ void drawStats(uint16_t mm, bool timeout, bool valid, bool measurable) {
   if (timeout) {
     st7735_set_color(ORANGE);
     st7735_print("TIMEOUT", FONT_SCALE_8X8);
-  } else if (valid) {
+  } else if (measurable) {
     st7735_set_color(GREENYELLOW);
     st7735_print("TRACKING", FONT_SCALE_8X8);
-  } else if (measurable) {
-    st7735_set_color(YELLOW);
-    st7735_print("WEAK", FONT_SCALE_8X8);
   } else {
     st7735_set_color(DARKGREY);
     st7735_print("NO ECHO", FONT_SCALE_8X8);
-  }
-}
-
-void updateScanRate() {
-  const uint32_t now = millis();
-  if (now - g_last_stats_ms >= 1000) {
-    const uint32_t dt = now - g_last_stats_ms;
-    g_scan_rate = (uint16_t)((g_scan_count * 1000U) / dt);
-    g_scan_count = 0;
-    g_last_stats_ms = now;
   }
 }
 
@@ -180,8 +207,37 @@ bool initSensor() {
   if (!g_sensor.init()) return false;
   g_sensor.setDistanceMode(VL53L1X::Long);
   g_sensor.setMeasurementTimingBudget(33000);
-  g_sensor.setROISize(kRoiSize, kRoiSize);
+  const uint8_t roi = currentRoiSize();
+  g_sensor.setROISize(roi, roi);
   return true;
+}
+
+void initSw1() {
+  funPinMode(kSw1Pin, GPIO_CFGLR_IN_PUPD);
+  funDigitalWrite(kSw1Pin, 1);
+  g_sw1_prev_level = (funDigitalRead(kSw1Pin) != 0);
+  g_sw1_last_change_ms = millis();
+}
+
+void handleRoiSwitch() {
+  const bool level = (funDigitalRead(kSw1Pin) != 0);
+  const uint32_t now = millis();
+  if (level != g_sw1_prev_level && (now - g_sw1_last_change_ms) > 30) {
+    g_sw1_last_change_ms = now;
+    g_sw1_prev_level = level;
+    if (!level) {
+      g_roi_mode_index = (uint8_t)((g_roi_mode_index + 1) % 4);
+      const uint8_t roi = currentRoiSize();
+      g_sensor.setROISize(roi, roi);
+      g_scan_index = 0;
+      g_prev_hx = -1;
+      g_prev_hy = -1;
+      g_cycle_has_min = false;
+      g_current_has_mm = false;
+      std::memset(g_heat, 0, sizeof(g_heat));
+      drawStaticUi();
+    }
+  }
 }
 
 #else
@@ -316,40 +372,54 @@ int main() {
 #endif
 
 #if defined(SENSOR_VL53L1X)
+  initSw1();
   drawStaticUi();
-  g_last_stats_ms = millis();
   while (1) {
-    const uint8_t x = (uint8_t)(g_scan_index % kGrid);
-    const uint8_t y = (uint8_t)(g_scan_index / kGrid);
-    const uint8_t spad = spadForXY(x, y);
+    handleRoiSwitch();
+    const uint8_t grid = currentGrid();
+    const uint8_t x = (uint8_t)(g_scan_index % grid);
+    const uint8_t y = (uint8_t)(g_scan_index / grid);
+    const uint8_t roi = currentRoiSize();
+    const uint16_t idx = g_scan_index;
+    if (idx == 0) {
+      g_cycle_has_min = false;
+    }
+    const uint8_t spad = (roi >= 16 || roi <= 1) ? 199 : spadForXY(x, y);
 
     g_sensor.setROICenter(spad);
     const uint16_t mm = g_sensor.readSingle(true);
     const bool timeout = g_sensor.timeoutOccurred();
-    const auto rs = g_sensor.ranging_data.range_status;
-    const bool status_ok =
-        rs == VL53L1X::RangeValid ||
-        rs == VL53L1X::RangeValidMinRangeClipped ||
-        rs == VL53L1X::RangeValidNoWrapCheckFail;
-    const bool sane_mm = mm > 0 && mm < 8000;
-    const bool measurable = !timeout && sane_mm;
-    const bool valid = measurable && status_ok && mm < 4000;
+    const bool measurable = !timeout && mm > 0 && mm < 4000;
+    const bool valid = measurable;
     if (measurable) {
-      g_last_mm = mm;
+      g_current_mm = mm;
+      g_current_has_mm = true;
+      if (!g_cycle_has_min || mm < g_cycle_min_mm) {
+        g_cycle_min_mm = mm;
+        g_cycle_has_min = true;
+      }
+      g_last_mm = g_cycle_min_mm;
       g_has_last_mm = true;
+    } else {
+      g_current_has_mm = false;
     }
 
-    const uint8_t intensity = intensityFromDistance(mm, measurable, valid);
-    const uint16_t idx = g_scan_index;
-    g_heat[idx] = (uint8_t)((g_heat[idx] * 3U + intensity) / 4U);
-    const uint16_t color = heatColor(g_heat[idx]);
-    st7735_fill_rect((uint16_t)(kGridX + x * kCell), (uint16_t)(kGridY + y * kCell), kCell - 1, kCell - 1, color);
+    if (measurable) {
+      g_heat[idx] = intensityFromDistance(mm, measurable, valid);
+    } else {
+      g_heat[idx] = 0;
+    }
+    if (g_prev_hx >= 0 && g_prev_hy >= 0 &&
+        (g_prev_hx != x || g_prev_hy != y)) {
+      drawHeatCell((uint8_t)g_prev_hx, (uint8_t)g_prev_hy, false);
+    }
+    drawHeatCell(x, y, true);
+    g_prev_hx = x;
+    g_prev_hy = y;
 
     g_scan_index++;
-    if (g_scan_index >= kPoints) g_scan_index = 0;
-    g_scan_count++;
-    updateScanRate();
-    drawStats(mm, timeout, valid, measurable);
+    if (g_scan_index >= currentPoints()) g_scan_index = 0;
+    drawStats(timeout, measurable);
   }
 #else
   g_sensor.startContinuous(60);
