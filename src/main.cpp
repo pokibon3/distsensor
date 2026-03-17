@@ -106,9 +106,27 @@ uint16_t heatColor(uint8_t v) {
 uint8_t intensityFromDistance(uint16_t mm, bool measurable, bool valid) {
   if (!measurable) return 0;
   if (!valid) return 96;
-  const uint16_t capped = (mm > 3000U) ? 3000U : mm;
-  const uint16_t inv = (uint16_t)(255U - (capped * 255U) / 3000U);
-  return (uint8_t)((inv < 8U) ? 8U : inv);
+  if (mm <= 100) return 255;
+  if (mm <= 200) return 230;
+  if (mm <= 300) return 205;
+  if (mm <= 450) return 182;
+  if (mm <= 650) return 162;
+  if (mm <= 900) return 145;
+  if (mm <= 1200) return 130;
+  if (mm <= 1550) return 118;
+  if (mm <= 1950) return 108;
+  if (mm <= 2350) return 100;
+  if (mm <= 2700) return 94;
+  if (mm <= 3000) return 90;
+  return 88;
+}
+
+void applyCurrentRoiConfig() {
+  const uint8_t roi = currentRoiSize();
+  g_sensor.setROISize(roi, roi);
+  if (roi >= 16 || roi <= 1) {
+    g_sensor.setROICenter(199);
+  }
 }
 
 void drawStaticUi() {
@@ -207,8 +225,7 @@ bool initSensor() {
   if (!g_sensor.init()) return false;
   g_sensor.setDistanceMode(VL53L1X::Long);
   g_sensor.setMeasurementTimingBudget(33000);
-  const uint8_t roi = currentRoiSize();
-  g_sensor.setROISize(roi, roi);
+  applyCurrentRoiConfig();
   return true;
 }
 
@@ -219,6 +236,17 @@ void initSw1() {
   g_sw1_last_change_ms = millis();
 }
 
+void applyModeConfigAndResetUi() {
+  applyCurrentRoiConfig();
+  g_scan_index = 0;
+  g_prev_hx = -1;
+  g_prev_hy = -1;
+  g_cycle_has_min = false;
+  g_current_has_mm = false;
+  std::memset(g_heat, 0, sizeof(g_heat));
+  drawStaticUi();
+}
+
 void handleRoiSwitch() {
   const bool level = (funDigitalRead(kSw1Pin) != 0);
   const uint32_t now = millis();
@@ -227,15 +255,7 @@ void handleRoiSwitch() {
     g_sw1_prev_level = level;
     if (!level) {
       g_roi_mode_index = (uint8_t)((g_roi_mode_index + 1) % 4);
-      const uint8_t roi = currentRoiSize();
-      g_sensor.setROISize(roi, roi);
-      g_scan_index = 0;
-      g_prev_hx = -1;
-      g_prev_hy = -1;
-      g_cycle_has_min = false;
-      g_current_has_mm = false;
-      std::memset(g_heat, 0, sizeof(g_heat));
-      drawStaticUi();
+      applyModeConfigAndResetUi();
     }
   }
 }
@@ -373,7 +393,19 @@ int main() {
 
 #if defined(SENSOR_VL53L1X)
   initSw1();
-  drawStaticUi();
+  applyModeConfigAndResetUi();
+
+  // 起動直後のみ、単発計測を短くウォームアップして初回TIMEOUTを回避する。
+  for (uint8_t i = 0; i < 4; ++i) {
+    const uint8_t boot_spad = (currentRoiSize() >= 16 || currentRoiSize() <= 1)
+                                  ? 199
+                                  : spadForXY(0, 0);
+    g_sensor.setROICenter(boot_spad);
+    (void)g_sensor.readSingle(true);
+    if (!g_sensor.timeoutOccurred()) break;
+    Delay_Ms(20);
+  }
+
   while (1) {
     handleRoiSwitch();
     const uint8_t grid = currentGrid();
