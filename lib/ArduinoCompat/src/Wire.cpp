@@ -47,6 +47,7 @@ void HardI2C::begin() {
   RCC->APB1PRSTR |= RCC_APB1Periph_I2C1;
   RCC->APB1PRSTR &= ~RCC_APB1Periph_I2C1;
 
+  // Match ch32fun examples: AF open-drain, 10MHz setting.
   funPinMode(kSdaPin, GPIO_CFGLR_OUT_10Mhz_AF_OD);
   funPinMode(kSclPin, GPIO_CFGLR_OUT_10Mhz_AF_OD);
 
@@ -65,13 +66,26 @@ void HardI2C::setSpeed(uint32_t hz) {
 
 void HardI2C::configureTiming() {
   const uint32_t pclk = FUNCONF_SYSTEM_CORE_CLOCK;
-  uint32_t pclk_mhz = pclk / 1000000;
-  if (pclk_mhz == 0) pclk_mhz = 1;
+  uint32_t freq_field = pclk / 1000000U;
+  if (freq_field == 0U) freq_field = 1U;
+  if (freq_field > 0x3FU) freq_field = 0x3FU;
 
-  // Match ch32fun i2c_init() behavior.
+  // Match ch32fun behavior:
+  // - <=100kHz: standard mode, CCR = PCLK / (2 * fSCL)
+  // - >100kHz: fast mode (33% duty), CCR = PCLK / (3 * fSCL), set FS bit
   I2C1->CTLR1 &= ~I2C_CTLR1_PE;
-  I2C1->CTLR2 = (uint16_t)pclk_mhz;
-  I2C1->CKCFGR = (uint16_t)(pclk / (clock_hz_ << 1));
+  I2C1->CTLR2 = (uint16_t)(freq_field & I2C_CTLR2_FREQ);
+  uint16_t ckcfgr = 0;
+  if (clock_hz_ <= 100000) {
+    uint32_t ccr = pclk / (clock_hz_ << 1);
+    if (ccr < 4U) ccr = 4U;
+    ckcfgr = (uint16_t)(ccr & I2C_CKCFGR_CCR);
+  } else {
+    uint32_t ccr = pclk / (clock_hz_ * 3U);
+    if (ccr == 0U) ccr = 1U;
+    ckcfgr = (uint16_t)((ccr & I2C_CKCFGR_CCR) | I2C_CKCFGR_FS);
+  }
+  I2C1->CKCFGR = ckcfgr;
   I2C1->CTLR1 |= I2C_CTLR1_PE;
   I2C1->CTLR1 |= I2C_CTLR1_ACK;
 }
@@ -107,10 +121,11 @@ void HardI2C::clearErrorFlags() {
 }
 
 bool HardI2C::generateStart() {
+  clearErrorFlags();
   uint32_t timeout = kI2cTimeout;
   while ((I2C1->STAR2 & I2C_STAR2_BUSY) && --timeout) {
   }
-  if (timeout == 0) return false;
+  // Match ch32fun i2c_sensor_test: even if BUSY wait expires, still try START.
   I2C1->CTLR1 |= I2C_CTLR1_START;
   return waitStar1Set(I2C_STAR1_SB, kI2cTimeout);
 }
@@ -173,6 +188,7 @@ bool HardI2C::read(uint8_t address, uint8_t *data, uint8_t length) {
     return false;
   }
 
+  // Match ch32fun i2c_sensor_test receive sequence.
   I2C1->CTLR1 |= I2C_CTLR1_ACK;
   clearAddrFlag();
 
